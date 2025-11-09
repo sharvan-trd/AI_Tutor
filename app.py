@@ -41,13 +41,13 @@ h1,h2,h3 {color: #1a237e;}
 """, unsafe_allow_html=True)
 
 # --- Safe diagnostics (helps confirm Cloud has the right secrets & DB) ---
-with st.expander("🔎 Diagnostics"):
-    masked_key = (GEMINI_API_KEY[:6] + "..." + GEMINI_API_KEY[-4:]) if GEMINI_API_KEY else "(missing)"
-    st.write("google-generativeai installed:", genai is not None)
-    st.write("GEMINI_API_KEY present:", bool(GEMINI_API_KEY), masked_key)
-    st.write("GEMINI_MODEL:", GEMINI_MODEL)
-    st.write("DB path:", DB_PATH)
-    st.write("AUTO_APPROVE_STUDENTS:", AUTO_APPROVE_STUDENTS)
+# with st.expander("🔎 Diagnostics"):
+#     masked_key = (GEMINI_API_KEY[:6] + "..." + GEMINI_API_KEY[-4:]) if GEMINI_API_KEY else "(missing)"
+#     st.write("google-generativeai installed:", genai is not None)
+#     st.write("GEMINI_API_KEY present:", bool(GEMINI_API_KEY), masked_key)
+#     st.write("GEMINI_MODEL:", GEMINI_MODEL)
+#     st.write("DB path:", DB_PATH)
+#     st.write("AUTO_APPROVE_STUDENTS:", AUTO_APPROVE_STUDENTS)
 
 # ================= Database Setup (cached, single connection) =================
 @st.cache_resource
