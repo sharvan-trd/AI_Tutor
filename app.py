@@ -14,11 +14,11 @@ except ImportError:
     genai = None
 
 # ================= Configuration =================
-# WARNING: Replace this placeholder with a real key in a secure manner for production
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyCn9HTzFrUX0quRSFQ9WUg4EcQxvqSImZg")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+# Use secrets or env; do NOT hardcode API keys
+GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
+GEMINI_MODEL = st.secrets.get("GEMINI_MODEL", os.getenv("GEMINI_MODEL", "gemini-2.0-flash"))
 DB_PATH = pathlib.Path(__file__).with_name("ai_tutor.db").as_posix()
-PASSWORD_SALT = os.getenv("AI_TUTOR_SALT", "change_this_salt")
+PASSWORD_SALT = st.secrets.get("AI_TUTOR_SALT", os.getenv("AI_TUTOR_SALT", "change_this_salt"))
 
 st.set_page_config(page_title="AI Tutor", page_icon="🎓", layout="wide")
 
@@ -83,6 +83,30 @@ CREATE TABLE IF NOT EXISTS sessions (
 ''')
 conn.commit()
 
+# ===== Ensure exactly one admin exists (create if missing) =====
+def ensure_single_admin():
+    admin_username = st.secrets.get("AI_TUTOR_ADMIN_USER", os.getenv("AI_TUTOR_ADMIN_USER", "admin"))
+    admin_fullname = st.secrets.get("AI_TUTOR_ADMIN_NAME", os.getenv("AI_TUTOR_ADMIN_NAME", "Administrator"))
+    admin_password = st.secrets.get("AI_TUTOR_ADMIN_PASS", os.getenv("AI_TUTOR_ADMIN_PASS", "admin123"))
+
+    cur.execute("SELECT id, username FROM users WHERE role='admin' ORDER BY id ASC")
+    rows = cur.fetchall()
+    if len(rows) == 0:
+        # create the only admin
+        h, salt = hash_password(admin_password)
+        cur.execute(
+            "INSERT INTO users (username, fullname, role, password_hash, salt, approved) VALUES (?,?,?,?,?,?)",
+            (admin_username, admin_fullname, "admin", h, salt, 1)
+        )
+        conn.commit()
+    elif len(rows) > 1:
+        # If multiple admins exist, keep the first and demote the rest to student
+        keep_id = rows[0][0]
+        extra_ids = tuple(r[0] for r in rows[1:])
+        qmarks = ",".join(["?"] * len(extra_ids))
+        cur.execute(f"UPDATE users SET role='student', approved=0 WHERE id IN ({qmarks})", extra_ids)
+        conn.commit()
+
 # ================= Utility Functions =================
 def hash_password(password, salt=None):
     if salt is None:
@@ -120,8 +144,9 @@ def authenticate(username, password):
     return True, {"id": uid, "username": uname, "fullname": fullname, "role": role}
 
 def call_gemini(prompt):
-    if not genai or GEMINI_API_KEY == "AIzaSyCn9HTzFrUX0quRSFQ9WUg4EcQxvqSImZg":
-        return "[Gemini not configured or API Key is missing. Please set a valid GEMINI_API_KEY.]"
+    # Only call if configured
+    if not genai or not GEMINI_API_KEY:
+        return "[Gemini not configured or API Key is missing. Please set GEMINI_API_KEY in Secrets.]"
     try:
         genai.configure(api_key=GEMINI_API_KEY)
         model = genai.GenerativeModel(GEMINI_MODEL)
@@ -149,12 +174,14 @@ def register_ui():
     st.subheader("Register")
     username = st.text_input("Username")
     fullname = st.text_input("Full Name")
-    role = st.selectbox("Role", ["student", "admin"])
     password = st.text_input("Password", type="password")
+
+    st.caption("You’ll be registered as a student. An admin will approve your account.")
+
     if st.button("Register"):
         if username and password:
-            approved = 1 if role == "admin" else 0
-            success, msg = create_user(username, fullname, role, password, approved)
+            approved = 0  # students need approval
+            success, msg = create_user(username, fullname, "student", password, approved)
             st.info(msg)
         else:
             st.warning("Please fill all fields!")
@@ -765,12 +792,14 @@ def student_dashboard(user):
 
 # ================= Main App =================
 def main():
+    # Ensure single admin exists before UI
+    ensure_single_admin()
+
     if 'student_test_taken' not in st.session_state:
         st.session_state['student_test_taken'] = {}
     if 'weekly_test' not in st.session_state:
         st.session_state['weekly_test'] = None
 
-    # st.markdown("<div class='main'>", unsafe_allow_html=True)
     st.title("🎓 AI Tutor Web App for Tuition Teachers")
 
     if "page" not in st.session_state:
@@ -794,22 +823,6 @@ def main():
         if st.button("Logout"):
             st.session_state.clear()
             st.rerun()
-
-    # # ---- Quick DB Debug Panel ----
-    # with st.expander("🔧 Debug: Database snapshot"):
-    #     try:
-    #         st.write("DB path:", DB_PATH)
-    #         u = pd.read_sql_query("SELECT id, username, fullname, role, approved, created_at FROM users ORDER BY id DESC LIMIT 10", conn)
-    #         s = pd.read_sql_query("SELECT id, user_id, subject, score, created_at FROM sessions ORDER BY id DESC LIMIT 20", conn)
-    #         st.write("Users (latest 10):", u)
-    #         st.write("Sessions (latest 20):", s)
-    #         total_users = pd.read_sql_query('SELECT COUNT(*) AS c FROM users', conn)['c'].iat[0]
-    #         total_sessions = pd.read_sql_query('SELECT COUNT(*) AS c FROM sessions', conn)['c'].iat[0]
-    #         st.info(f"Totals → users: {total_users}, sessions: {total_sessions}")
-    #     except Exception as e:
-    #         st.error(f"Debug error: {e}")
-
-    st.markdown("</div>", unsafe_allow_html=True)
 
 if __name__=="__main__":
     main()
