@@ -6,6 +6,8 @@ import secrets
 import streamlit as st
 from datetime import datetime, timedelta
 import pathlib
+from dotenv import load_dotenv
+load_dotenv()  # this loads variables from .env into os.environ
 
 # Optional Gemini import
 try:
