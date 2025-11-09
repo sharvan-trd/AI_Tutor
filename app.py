@@ -6,8 +6,13 @@ import secrets
 import streamlit as st
 from datetime import datetime, timedelta
 import pathlib
-from dotenv import load_dotenv
-load_dotenv()  # this loads variables from .env into os.environ
+
+# --- Local-only: load .env (has no effect on Streamlit Cloud) ---
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 # Optional Gemini import
 try:
@@ -21,6 +26,7 @@ GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""
 GEMINI_MODEL = st.secrets.get("GEMINI_MODEL", os.getenv("GEMINI_MODEL", "gemini-2.0-flash"))
 DB_PATH = pathlib.Path(__file__).with_name("ai_tutor.db").as_posix()
 PASSWORD_SALT = st.secrets.get("AI_TUTOR_SALT", os.getenv("AI_TUTOR_SALT", "change_this_salt"))
+AUTO_APPROVE_STUDENTS = str(st.secrets.get("AUTO_APPROVE_STUDENTS", os.getenv("AUTO_APPROVE_STUDENTS", "0"))).strip() == "1"
 
 st.set_page_config(page_title="AI Tutor", page_icon="🎓", layout="wide")
 
@@ -33,6 +39,15 @@ h1,h2,h3 {color: #1a237e;}
 .stButton>button:hover {background-color:#283593; color:white;}
 </style>
 """, unsafe_allow_html=True)
+
+# --- Safe diagnostics (helps confirm Cloud has the right secrets & DB) ---
+with st.expander("🔎 Diagnostics"):
+    masked_key = (GEMINI_API_KEY[:6] + "..." + GEMINI_API_KEY[-4:]) if GEMINI_API_KEY else "(missing)"
+    st.write("google-generativeai installed:", genai is not None)
+    st.write("GEMINI_API_KEY present:", bool(GEMINI_API_KEY), masked_key)
+    st.write("GEMINI_MODEL:", GEMINI_MODEL)
+    st.write("DB path:", DB_PATH)
+    st.write("AUTO_APPROVE_STUDENTS:", AUTO_APPROVE_STUDENTS)
 
 # ================= Database Setup (cached, single connection) =================
 @st.cache_resource
@@ -85,30 +100,6 @@ CREATE TABLE IF NOT EXISTS sessions (
 ''')
 conn.commit()
 
-# ===== Ensure exactly one admin exists (create if missing) =====
-def ensure_single_admin():
-    admin_username = st.secrets.get("AI_TUTOR_ADMIN_USER", os.getenv("AI_TUTOR_ADMIN_USER", "admin"))
-    admin_fullname = st.secrets.get("AI_TUTOR_ADMIN_NAME", os.getenv("AI_TUTOR_ADMIN_NAME", "Administrator"))
-    admin_password = st.secrets.get("AI_TUTOR_ADMIN_PASS", os.getenv("AI_TUTOR_ADMIN_PASS", "admin123"))
-
-    cur.execute("SELECT id, username FROM users WHERE role='admin' ORDER BY id ASC")
-    rows = cur.fetchall()
-    if len(rows) == 0:
-        # create the only admin
-        h, salt = hash_password(admin_password)
-        cur.execute(
-            "INSERT INTO users (username, fullname, role, password_hash, salt, approved) VALUES (?,?,?,?,?,?)",
-            (admin_username, admin_fullname, "admin", h, salt, 1)
-        )
-        conn.commit()
-    elif len(rows) > 1:
-        # If multiple admins exist, keep the first and demote the rest to student
-        keep_id = rows[0][0]
-        extra_ids = tuple(r[0] for r in rows[1:])
-        qmarks = ",".join(["?"] * len(extra_ids))
-        cur.execute(f"UPDATE users SET role='student', approved=0 WHERE id IN ({qmarks})", extra_ids)
-        conn.commit()
-
 # ================= Utility Functions =================
 def hash_password(password, salt=None):
     if salt is None:
@@ -145,6 +136,48 @@ def authenticate(username, password):
         return False, "Awaiting teacher approval."
     return True, {"id": uid, "username": uname, "fullname": fullname, "role": role}
 
+# ===== Ensure exactly one admin exists and sync to Secrets each run =====
+def ensure_single_admin():
+    # Read from Secrets/Env and strip whitespace
+    admin_username = str(st.secrets.get("AI_TUTOR_ADMIN_USER", os.getenv("AI_TUTOR_ADMIN_USER", "admin"))).strip()
+    admin_fullname = str(st.secrets.get("AI_TUTOR_ADMIN_NAME", os.getenv("AI_TUTOR_ADMIN_NAME", "Administrator"))).strip()
+    admin_password = str(st.secrets.get("AI_TUTOR_ADMIN_PASS", os.getenv("AI_TUTOR_ADMIN_PASS", "admin123"))).strip()
+
+    if not admin_username:
+        admin_username = "admin"
+    if not admin_fullname:
+        admin_fullname = "Administrator"
+    if not admin_password:
+        admin_password = "admin123"
+
+    # Hash with fresh salt so the password exactly matches the secret value
+    h, salt = hash_password(admin_password)
+
+    # Upsert the admin by username
+    cur.execute("SELECT id FROM users WHERE username=?", (admin_username,))
+    row = cur.fetchone()
+    if row is None:
+        cur.execute(
+            "INSERT INTO users (username, fullname, role, password_hash, salt, approved) VALUES (?,?,?,?,?,?)",
+            (admin_username, admin_fullname, "admin", h, salt, 1)
+        )
+        conn.commit()
+    else:
+        admin_id = row[0]
+        cur.execute(
+            "UPDATE users SET fullname=?, role='admin', password_hash=?, salt=?, approved=1 WHERE id=?",
+            (admin_fullname, h, salt, admin_id)
+        )
+        conn.commit()
+
+    # Demote any other admins (keep only this username as admin)
+    cur.execute("SELECT id FROM users WHERE role='admin' AND username<>?", (admin_username,))
+    extras = cur.fetchall()
+    if extras:
+        cur.executemany("UPDATE users SET role='student', approved=0 WHERE id=?", [(e[0],) for e in extras])
+        conn.commit()
+
+# ================= AI =================
 def call_gemini(prompt):
     # Only call if configured
     if not genai or not GEMINI_API_KEY:
@@ -178,22 +211,30 @@ def register_ui():
     fullname = st.text_input("Full Name")
     password = st.text_input("Password", type="password")
 
-    st.caption("You’ll be registered as a student. An admin will approve your account.")
+    if AUTO_APPROVE_STUDENTS:
+        st.caption("Registration will be auto-approved on this deployment.")
+    else:
+        st.caption("You’ll be registered as a student. An admin will approve your account.")
 
     if st.button("Register"):
-        if username and password:
-            approved = 0  # students need approval
-            success, msg = create_user(username, fullname, "student", password, approved)
+        uname = (username or "").strip()
+        fname = (fullname or "").strip()
+        pwd = (password or "").strip()
+        if uname and pwd:
+            approved = 1 if AUTO_APPROVE_STUDENTS else 0
+            success, msg = create_user(uname, fname, "student", pwd, approved)
             st.info(msg)
         else:
-            st.warning("Please fill all fields!")
+            st.warning("Please fill all required fields (username & password).")
 
 def login_ui():
     st.subheader("Login")
     username = st.text_input("Username", key="login_username")
     password = st.text_input("Password", type="password", key="login_password")
     if st.button("Login"):
-        success, result = authenticate(username, password)
+        uname = (username or "").strip()
+        pwd = (password or "").strip()
+        success, result = authenticate(uname, pwd)
         if success:
             st.session_state["user"] = result
             st.session_state["page"] = "dashboard"
@@ -249,7 +290,7 @@ def admin_dashboard(user):
         if "prev_filter_diff" not in st.session_state:
             st.session_state.prev_filter_diff = filter_difficulty
 
-        # Auto-clear editor when filters change (new mode)
+        # Auto-clear editor when filters change
         filter_changed = (
             st.session_state.prev_filter_subject != filter_subject
             or st.session_state.prev_filter_diff != filter_difficulty
@@ -794,7 +835,7 @@ def student_dashboard(user):
 
 # ================= Main App =================
 def main():
-    # Ensure single admin exists before UI
+    # Ensure single admin exists and matches Secrets before showing UI
     ensure_single_admin()
 
     if 'student_test_taken' not in st.session_state:
@@ -807,16 +848,16 @@ def main():
     if "page" not in st.session_state:
         st.session_state["page"] = "home"
 
-    if st.session_state["page"]=="home":
+    if st.session_state["page"] == "home":
         login_tab, register_tab = st.tabs(["Login", "Register"])
         with login_tab:
             login_ui()
         with register_tab:
             register_ui()
 
-    elif st.session_state["page"]=="dashboard":
+    elif st.session_state["page"] == "dashboard":
         user = st.session_state.get("user")
-        if user["role"]=="admin":
+        if user["role"] == "admin":
             admin_dashboard(user)
         else:
             student_dashboard(user)
@@ -826,5 +867,5 @@ def main():
             st.session_state.clear()
             st.rerun()
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
